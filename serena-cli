@@ -1,0 +1,50 @@
+#!/bin/bash
+# serena-cli — CLI wrapper for Serena MCP daemon
+# Usage:
+#   serena-cli <tool_name> '<json_args>'
+#   serena-cli --project /path/to/project <tool_name> '<json_args>'
+#   serena-cli --stop
+#   serena-cli --status
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DAEMON_SCRIPT="$SCRIPT_DIR/serena-daemon.py"
+PROJECT=""
+
+# Parse options
+while [[ "$1" == --* ]]; do
+    case "$1" in
+        --project)
+            PROJECT="$2"
+            shift 2
+            ;;
+        --stop)
+            PROJECT="${PROJECT:-${SERENA_PROJECT:-$(pwd)}}"
+            exec python3 "$DAEMON_SCRIPT" stop "$PROJECT"
+            ;;
+        --status)
+            PROJECT="${PROJECT:-${SERENA_PROJECT:-$(pwd)}}"
+            exec python3 "$DAEMON_SCRIPT" status "$PROJECT"
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Determine project path
+PROJECT="${PROJECT:-${SERENA_PROJECT:-$(pwd)}}"
+
+# Tool name and args
+TOOL="$1"
+ARGS="${2:-\{\}}"
+
+if [ -z "$TOOL" ]; then
+    echo "Usage: serena-cli [--project PATH] <tool_name> '<json_args>'" >&2
+    echo "" >&2
+    echo "Tools: find_symbol, get_symbols_overview, search_for_pattern," >&2
+    echo "       find_referencing_symbols, find_file, list_dir" >&2
+    exit 1
+fi
+
+exec python3 "$DAEMON_SCRIPT" call "$PROJECT" "$TOOL" "$ARGS"
