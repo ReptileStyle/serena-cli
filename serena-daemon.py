@@ -27,7 +27,10 @@ SERENA_CMD = [
 
 SOCKET_DIR = "/tmp"
 CALL_TIMEOUT = 70  # seconds for a single tool call (Serena tool_timeout=60 + overhead)
-STARTUP_TIMEOUT = 90  # seconds to wait for daemon startup
+INIT_TIMEOUT = 120  # seconds for Serena initialize handshake (uvx cold start can be slow)
+RESTART_TIMEOUT = 130  # total budget for kill + restart
+KILL_TIMEOUT = 10  # seconds to wait for process to die after kill
+STARTUP_TIMEOUT = 90  # seconds to wait for daemon startup (client-side)
 RECV_BUF = 65536
 
 
@@ -178,23 +181,36 @@ class SerenaDaemon:
         server_info = resp.get("result", {}).get("serverInfo", {})
         print(f"[daemon] Serena initialized: {server_info}", file=sys.stderr)
 
-    async def _restart_serena(self):
-        """Kill dead/stuck Serena and start fresh."""
-        print("[daemon] Restarting Serena...", file=sys.stderr)
+    async def _kill_proc(self):
+        """Kill current Serena process and reader task, with timeouts."""
         if self.proc and self.proc.returncode is None:
             self.proc.kill()
-            await self.proc.wait()
+            try:
+                await asyncio.wait_for(self.proc.wait(), timeout=KILL_TIMEOUT)
+            except asyncio.TimeoutError:
+                print(f"[daemon] Process didn't die after {KILL_TIMEOUT}s SIGKILL", file=sys.stderr)
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
             try:
                 await self._reader_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
         self.pending.clear()
         self.request_id = 0
-        self._healthy = True
-        await self.start_serena()
-        print("[daemon] Serena restarted successfully", file=sys.stderr)
+
+    async def _restart_serena(self):
+        """Kill dead/stuck Serena and start fresh."""
+        print("[daemon] Restarting Serena...", file=sys.stderr)
+        await self._kill_proc()
+        try:
+            await asyncio.wait_for(self.start_serena(), timeout=INIT_TIMEOUT)
+            self._healthy = True
+            print("[daemon] Serena restarted successfully", file=sys.stderr)
+        except Exception as e:
+            print(f"[daemon] Restart failed: {e}", file=sys.stderr)
+            self._healthy = False
+            await self._kill_proc()
+            raise RuntimeError(f"Serena restart failed: {e}")
 
     async def call_tool(self, tool_name: str, args: dict) -> dict:
         """Call a Serena tool. Returns {"text": "...", "isError": bool}."""
