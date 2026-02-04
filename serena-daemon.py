@@ -26,7 +26,7 @@ SERENA_CMD = [
 ]
 
 SOCKET_DIR = "/tmp"
-CALL_TIMEOUT = 120  # seconds for a single tool call
+CALL_TIMEOUT = 70  # seconds for a single tool call (Serena tool_timeout=60 + overhead)
 STARTUP_TIMEOUT = 90  # seconds to wait for daemon startup
 RECV_BUF = 65536
 
@@ -61,6 +61,27 @@ def is_daemon_running(project_path: str) -> bool:
         return False
 
 
+def _kill_stale_serena_processes(project_path: str):
+    """Kill any existing Serena processes for this project (zombie cleanup)."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"serena.*start-mcp-server.*--project.*{project_path}"],
+            capture_output=True, text=True,
+        )
+        if result.stdout.strip():
+            my_pid = os.getpid()
+            for line in result.stdout.strip().split("\n"):
+                pid = int(line.strip())
+                if pid != my_pid:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        print(f"[daemon] Killed stale Serena process {pid}", file=sys.stderr)
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Daemon
 # ---------------------------------------------------------------------------
@@ -75,31 +96,39 @@ class SerenaDaemon:
         self.lock = asyncio.Lock()
         self.pending: dict[int, asyncio.Future] = {}
         self._reader_task = None
+        self._healthy = True
 
     # -- MCP communication --------------------------------------------------
 
     async def _send(self, msg: dict):
         data = json.dumps(msg, ensure_ascii=False) + "\n"
         self.proc.stdin.write(data.encode("utf-8"))
-        await self.proc.stdin.drain()
+        await asyncio.wait_for(self.proc.stdin.drain(), timeout=10)
 
     async def _read_loop(self):
         """Read JSON-RPC responses from Serena stdout, dispatch to pending futures."""
-        while True:
-            line = await self.proc.stdout.readline()
-            if not line:
-                break
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            rid = msg.get("id")
-            if rid is not None and rid in self.pending:
-                self.pending[rid].set_result(msg)
-            # Notifications (no id) are silently ignored
+        try:
+            while True:
+                line = await self.proc.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                rid = msg.get("id")
+                if rid is not None and rid in self.pending:
+                    self.pending[rid].set_result(msg)
+                # Notifications (no id) are silently ignored
+        finally:
+            self._healthy = False
+            for rid, future in list(self.pending.items()):
+                if not future.done():
+                    future.set_exception(RuntimeError("Serena process died"))
+            print("[daemon] Read loop ended — Serena process died or closed stdout", file=sys.stderr)
 
     async def _request(self, method: str, params: dict | None = None) -> dict:
         self.request_id += 1
@@ -113,6 +142,10 @@ class SerenaDaemon:
         await self._send(msg)
         try:
             result = await asyncio.wait_for(future, timeout=CALL_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._healthy = False
+            print(f"[daemon] Request {method} timed out after {CALL_TIMEOUT}s — marking unhealthy", file=sys.stderr)
+            raise
         finally:
             self.pending.pop(rid, None)
         return result
@@ -145,9 +178,29 @@ class SerenaDaemon:
         server_info = resp.get("result", {}).get("serverInfo", {})
         print(f"[daemon] Serena initialized: {server_info}", file=sys.stderr)
 
+    async def _restart_serena(self):
+        """Kill dead/stuck Serena and start fresh."""
+        print("[daemon] Restarting Serena...", file=sys.stderr)
+        if self.proc and self.proc.returncode is None:
+            self.proc.kill()
+            await self.proc.wait()
+        if self._reader_task and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except asyncio.CancelledError:
+                pass
+        self.pending.clear()
+        self.request_id = 0
+        self._healthy = True
+        await self.start_serena()
+        print("[daemon] Serena restarted successfully", file=sys.stderr)
+
     async def call_tool(self, tool_name: str, args: dict) -> dict:
         """Call a Serena tool. Returns {"text": "...", "isError": bool}."""
         async with self.lock:
+            if not self._healthy:
+                await self._restart_serena()
             resp = await self._request("tools/call", {
                 "name": tool_name,
                 "arguments": args,
@@ -185,6 +238,9 @@ class SerenaDaemon:
             await writer.wait_closed()
 
     async def run(self):
+        # Kill stale Serena processes for this project
+        _kill_stale_serena_processes(self.project_path)
+
         # Cleanup stale socket
         if os.path.exists(self.sock_path):
             os.unlink(self.sock_path)
@@ -263,16 +319,8 @@ def ensure_daemon(project_path: str):
     sys.exit(1)
 
 
-def call_tool(project_path: str, tool_name: str, args_json: str) -> int:
-    """Connect to daemon, call tool, print result. Returns exit code."""
-    ensure_daemon(project_path)
-
-    try:
-        args = json.loads(args_json)
-    except json.JSONDecodeError as e:
-        print(f"ERROR: Invalid JSON args: {e}", file=sys.stderr)
-        return 1
-
+def _do_call(project_path: str, tool_name: str, args: dict) -> dict | None:
+    """Send a single tool call to daemon. Returns result dict or None on connection error."""
     sp = socket_path(project_path)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -288,20 +336,45 @@ def call_tool(project_path: str, tool_name: str, args_json: str) -> int:
             if not chunk:
                 break
             data += chunk
-    except ConnectionRefusedError:
-        print("ERROR: Daemon not accepting connections. Try: serena-cli --stop, then retry.", file=sys.stderr)
-        return 1
+    except (ConnectionRefusedError, socket.timeout, OSError) as e:
+        print(f"ERROR: Connection to daemon failed: {e}", file=sys.stderr)
+        return None
     finally:
         sock.close()
 
     try:
-        result = json.loads(data.decode("utf-8"))
+        return json.loads(data.decode("utf-8"))
     except json.JSONDecodeError:
-        print(data.decode("utf-8", errors="replace"))
+        print(data.decode("utf-8", errors="replace"), file=sys.stderr)
+        return None
+
+
+def call_tool(project_path: str, tool_name: str, args_json: str) -> int:
+    """Connect to daemon, call tool, print result. Returns exit code."""
+    ensure_daemon(project_path)
+
+    try:
+        args = json.loads(args_json)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Invalid JSON args: {e}", file=sys.stderr)
+        return 1
+
+    result = _do_call(project_path, tool_name, args)
+    if result is None:
         return 1
 
     text = result.get("text", "")
     is_error = result.get("isError", False)
+
+    # Auto-retry once if Serena restarted
+    if is_error and ("process died" in text or "timed out" in text.lower()):
+        print("[retry] Serena recovering, retrying...", file=sys.stderr)
+        time.sleep(2)
+        result = _do_call(project_path, tool_name, args)
+        if result is None:
+            return 1
+        text = result.get("text", "")
+        is_error = result.get("isError", False)
 
     print(text)
     return 1 if is_error else 0
