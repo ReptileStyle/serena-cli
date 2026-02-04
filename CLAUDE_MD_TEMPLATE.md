@@ -1,4 +1,4 @@
-# Шаблон секции для CLAUDE.md
+# Serena CLI — шаблон секции для CLAUDE.md
 
 Скопируйте секцию ниже в CLAUDE.md вашего проекта.
 
@@ -15,14 +15,65 @@ serena-cli <tool_name> '<json_args>'
 
 Daemon стартует автоматически при первом вызове. Все пути (`relative_path`) — относительно корня проекта.
 
-### Принципы работы с кодом
+### СТРОГИЕ ПРАВИЛА (обязательны для ВСЕХ агентов)
 
-- **Избегай чтения целых файлов.** Сначала `get_symbols_overview` для понимания структуры, затем `find_symbol` с `include_body: true` для чтения конкретных символов.
-- **Символы идентифицируются через name_path** — путь в дереве символов внутри файла. Метод `bar` в классе `Foo` имеет name_path `Foo/bar`. При перегрузке добавляется индекс: `Foo/bar[0]`.
-- **Для рефакторинга** — `find_referencing_symbols` покажет все использования символа в кодовой базе.
-- **Предпочитай символьные тулы** (`find_symbol`, `get_symbols_overview`) перед `search_for_pattern`, если знаешь имя символа. `search_for_pattern` — для произвольных паттернов или поиска в не-код файлах.
-- **Используй `relative_path`** для ограничения области поиска — это значительно ускоряет работу.
-- **НЕ используй Serena для редактирования** — только навигация и поиск.
+1. **ЗАПРЕЩЕНО использовать Grep и Glob для поиска по коду проекта** пока Serena доступна.
+   - Используй `serena-cli` для ЛЮБОГО поиска и навигации по коду.
+   - Grep/Glob **разрешены ТОЛЬКО** если `serena-cli` вернул ошибку (daemon упал, таймаут, etc.) или для поиска вне проекта.
+   - **Read РАЗРЕШЁН всегда** — Serena ищет нужное, Read читает. Это нормальный workflow.
+
+2. **ЗАПРЕЩЕНО читать целые .dart файлы вместо символьного доступа.**
+   - Хочешь понять структуру файла → `get_symbols_overview`
+   - Хочешь увидеть метод/класс → `find_symbol` с `include_body: true`
+   - Если ты уже прочитал файл целиком — НЕ анализируй его повторно символьными тулами, у тебя уже есть информация.
+
+3. **Приоритет тулов для поиска** (от высшего к низшему):
+   - `find_symbol` / `get_symbols_overview` — если знаешь имя символа или файл
+   - `find_referencing_symbols` — если ищешь использования
+   - `search_for_pattern` — если не знаешь точное имя символа или ищешь в не-код файлах
+   - `find_file` / `list_dir` — для навигации по файловой структуре
+   - Grep/Glob — **ТОЛЬКО при ошибке Serena**
+   - Read — разрешён всегда
+
+4. **НЕ используй Serena для редактирования** — только навигация и поиск.
+
+### Workflow навигации по коду
+
+**Символы идентифицируются через name_path** — путь в дереве символов внутри файла.
+Метод `bar` в классе `Foo` имеет name_path `Foo/bar`. При перегрузке добавляется индекс: `Foo/bar[0]`.
+
+**Пошаговый подход — от общего к конкретному:**
+
+1. **Не знаешь структуру файла** → `get_symbols_overview` для обзора
+2. **Знаешь класс, хочешь список методов** → `find_symbol` с `depth: 1`
+3. **Хочешь прочитать конкретный метод** → `find_symbol` с `include_body: true`
+4. **Не знаешь имя символа** → `search_for_pattern` для поиска кандидатов, затем символьные тулы
+5. **Ищешь все использования** → `find_referencing_symbols`
+
+**Используй `relative_path`** для ограничения области поиска — это значительно ускоряет работу.
+
+**Пример workflow (Dart):**
+```bash
+# 1. Что в файле?
+serena-cli get_symbols_overview '{"relative_path": "lib/src/resources/repository/tasks.dart"}'
+
+# 2. Вижу TasksRepository — какие у него методы?
+serena-cli find_symbol '{"name_path_pattern": "TasksRepository", "depth": 1}'
+
+# 3. Хочу прочитать реализацию fetch
+serena-cli find_symbol '{"name_path_pattern": "TasksRepository/fetch", "include_body": true}'
+
+# 4. Не знаю точное имя, ищу по паттерну
+serena-cli search_for_pattern '{"substring_pattern": "registerSingleton.*Tasks", "relative_path": "lib/src/"}'
+
+# 5. Где используется TasksRepository?
+serena-cli find_referencing_symbols '{"name_path": "TasksRepository", "relative_path": "lib/src/resources/repository/tasks.dart"}'
+```
+
+### Когда НЕ использовать Serena
+
+- `serena-cli` вернул ошибку → fallback на Grep/Glob
+- Поиск вне проекта → Grep/Glob
 
 ### Тулы
 
